@@ -218,8 +218,9 @@ if planned_file and library_file:
     df_planned["중복여부"] = results[0]
     df_planned["대조근거"] = results[1]
 
-    # 출력 컬럼 순서 정리
-    output_cols = ["중복여부", "대조근거"] + ALADDIN_COLS
+    # 출력 컬럼 순서: 중복여부·대조근거를 앞에, 나머지 원본 컬럼 전체 표시
+    extra_cols = [c for c in df_planned.columns if c not in ("중복여부", "대조근거", "_isbn_clean")]
+    output_cols = ["중복여부", "대조근거"] + extra_cols
     final_df = df_planned[output_cols]
 
     # ────────────────────────────────────────────
