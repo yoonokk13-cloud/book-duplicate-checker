@@ -152,9 +152,17 @@ if planned_file and library_file:
     if df_planned is None or df_library is None:
         st.stop()
 
-    if "ISBN13" not in df_planned.columns:
-        st.error("알라딘 파일에 'ISBN13' 컬럼이 없습니다. 파일을 확인하세요.")
-        st.stop()
+    # 알라딘 ISBN13 컬럼 자동 탐색 (컬럼명이 조금 달라도 대응)
+    planned_isbn_col = next(
+        (c for c in df_planned.columns if "isbn" in c.lower()),
+        None,
+    )
+    if planned_isbn_col and planned_isbn_col != "ISBN13":
+        df_planned = df_planned.rename(columns={planned_isbn_col: "ISBN13"})
+        st.info(f"알라딘 파일의 ISBN 컬럼 `{planned_isbn_col}`을 `ISBN13`으로 인식했습니다.")
+    elif not planned_isbn_col:
+        st.warning("알라딘 파일에 ISBN 컬럼이 없습니다. 서명·저자 기준으로만 대조합니다.")
+        df_planned["ISBN13"] = ""  # 빈 컬럼 추가 — 이후 로직에서 ISBN 없음으로 처리됨
 
     st.success(
         f"✅ 구입 예정 목록 **{len(df_planned):,}건** | 소장 목록 **{len(df_library):,}건** 로드 완료"
