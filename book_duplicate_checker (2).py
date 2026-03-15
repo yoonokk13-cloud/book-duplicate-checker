@@ -188,31 +188,41 @@ if planned_file and library_file:
 
     # ────────────────────────────────────────────
     # 대조 로직
-    # 소장 목록에 ISBN13 없으므로 서명+저자 기준으로 대조
+    # 1단계: 서명 일치 확인
+    # 2단계: 동명이서 의심 시 출판사까지 확인
     # ────────────────────────────────────────────
 
-    # 소장 목록 서명+저자 세트 구성
-    existing_title_author = set(
-        zip(
-            df_library["서명"].apply(clean_text),
-            df_library["저자"].apply(clean_text),
-        )
-    )
+    # 소장 목록 — 서명별 출판사 목록 딕셔너리 { 정규화된_서명: [출판사, ...] }
+    from collections import defaultdict
+    title_to_publishers = defaultdict(list)
+    for _, lib_row in df_library.iterrows():
+        t = clean_text(lib_row["서명"])
+        p = clean_text(lib_row["출판사"])
+        if t and t != "nan":
+            title_to_publishers[t].append(p)
 
     def check_row(row) -> tuple:
-        title  = clean_text(row["서명"])
-        author = clean_text(row["저자"])
-        isbn   = clean_isbn(row["ISBN13"])
+        title     = clean_text(row["서명"])
+        publisher = clean_text(row["출판사"])
 
-        # ISBN13이 있고 소장 목록에도 ISBN 컬럼이 있으면 ISBN 우선 (현재 소장 목록은 ISBN 없음)
-        # → 서명+저자로 대조
         if not title or title == "nan":
             return "⚠️ 확인 필요", "서명 정보 없음"
 
-        if (title, author) in existing_title_author:
-            return "❌ 소장 중(중복)", "서명+저자 일치"
+        matched_publishers = title_to_publishers.get(title)
 
-        return "✅ 신규(구입 가능)", "서명+저자 불일치"
+        # 1단계: 서명 일치하는 책 없음 → 신규
+        if not matched_publishers:
+            return "✅ 신규(구입 가능)", "서명 불일치"
+
+        # 서명 일치하는 책이 1권 → 소장 중
+        if len(matched_publishers) == 1:
+            return "❌ 소장 중(중복)", "서명 일치"
+
+        # 2단계: 서명 일치 2권 이상 → 출판사까지 비교
+        if publisher in matched_publishers:
+            return "❌ 소장 중(중복)", "서명+출판사 일치"
+
+        return "✅ 신규(구입 가능)", "동명이서(출판사 불일치)"
 
     results = df_planned.apply(check_row, axis=1, result_type="expand")
     df_planned["중복여부"] = results[0]
