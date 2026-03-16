@@ -181,11 +181,14 @@ def show_mapping_editor(df: pd.DataFrame, required: list[str], label: str) -> pd
 # ────────────────────────────────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_isbn_from_aladin(title: str, author: str, ttb_key: str) -> str | None:
+def fetch_isbn_from_aladin(title: str, author: str, ttb_key: str) -> tuple[str | None, str]:
     """
-    알라딘 API로 서명+저자 검색 → ISBN13 반환.
-    결과는 1시간 캐싱 — 같은 서명은 재실행해도 API 재호출 없음.
+    알라딘 API로 서명+저자 검색 → (ISBN13 or None, 실패사유) 반환.
+    결과는 1시간 캐싱.
     """
+    if not ttb_key:
+        return None, "API 키 없음"
+
     query = f"{title} {author}".strip()
     url = "https://www.aladin.co.kr/ttb/api/ItemSearch.aspx"
     params = {
@@ -199,18 +202,44 @@ def fetch_isbn_from_aladin(title: str, author: str, ttb_key: str) -> str | None:
         "Version": "20131101",
     }
     try:
-        resp = requests.get(url, params=params, timeout=5)
-        data = resp.json()
+        resp = requests.get(url, params=params, timeout=8)
+
+        # HTTP 오류 체크
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+
+        # JSON 파싱 시도
+        try:
+            data = resp.json()
+        except Exception:
+            # 알라딘 API가 가끔 XML이나 에러 텍스트를 반환하는 경우 대응
+            return None, f"JSON 파싱 실패: {resp.text[:80]}"
+
+        # API 자체 에러 메시지 체크
+        if data.get("errorCode"):
+            return None, f"API 오류: {data.get('errorMessage', data.get('errorCode'))}"
+
         items = data.get("item", [])
         if not items:
-            return None
+            return None, "검색 결과 없음"
+
+        # 서명 완전 일치 우선
         title_norm = clean_text(title)
         for item in items:
             if clean_text(item.get("title", "")) == title_norm:
-                return str(item.get("isbn13", "")) or None
-        return str(items[0].get("isbn13", "")) or None
-    except Exception:
-        return None
+                isbn = str(item.get("isbn13", "")).strip()
+                return (isbn if len(isbn) == 13 else None), "서명 완전 일치"
+
+        # 일치 없으면 첫 번째 결과
+        isbn = str(items[0].get("isbn13", "")).strip()
+        return (isbn if len(isbn) == 13 else None), "첫 번째 결과 사용"
+
+    except requests.Timeout:
+        return None, "타임아웃 (8초 초과)"
+    except requests.ConnectionError:
+        return None, "네트워크 연결 오류"
+    except Exception as e:
+        return None, f"알 수 없는 오류: {str(e)[:60]}" 
 
 def enrich_library_with_isbn(df: pd.DataFrame, ttb_key: str) -> pd.DataFrame:
     """
@@ -228,12 +257,13 @@ def enrich_library_with_isbn(df: pd.DataFrame, ttb_key: str) -> pd.DataFrame:
                 and len(clean_isbn(df.at[idx, "ISBN13"])) == 13)
     ]
 
-    total   = len(df)
-    to_fetch = len(needs_lookup)
+    total      = len(df)
+    to_fetch   = len(needs_lookup)
     done_count = total - to_fetch
 
-    progress = st.progress(done_count / total, text=f"ISBN 조회 중... (0/{to_fetch})")
+    progress  = st.progress(done_count / total, text=f"ISBN 조회 중... (0/{to_fetch})")
     completed = 0
+    fail_log  = []  # 실패 기록
 
     # 병렬 호출: 최대 10개 동시
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -249,8 +279,14 @@ def enrich_library_with_isbn(df: pd.DataFrame, ttb_key: str) -> pd.DataFrame:
 
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
-            isbn = future.result()
+            isbn, reason = future.result()  # 튜플 언패킹
             df.at[idx, "ISBN13"] = isbn if isbn else ""
+
+            if not isbn:
+                fail_log.append({
+                    "서명": df.at[idx, "서명"],
+                    "실패사유": reason,
+                })
 
             completed += 1
             progress.progress(
@@ -262,7 +298,27 @@ def enrich_library_with_isbn(df: pd.DataFrame, ttb_key: str) -> pd.DataFrame:
     found = df["ISBN13"].apply(
         lambda x: clean_isbn(x) not in ("", "nan") and len(clean_isbn(x)) == 13
     ).sum()
+    failed = to_fetch - found
+
     st.success(f"ISBN 조회 완료: 전체 {total}건 중 **{found}건** 확인")
+
+    # 실패 항목 상세 표시
+    if fail_log:
+        with st.expander(f"⚠️ ISBN 조회 실패 {len(fail_log)}건 — 상세 보기"):
+            st.caption("아래 도서는 ISBN을 찾지 못했습니다. 서명+출판사 기준으로 대조됩니다.")
+            st.dataframe(pd.DataFrame(fail_log), use_container_width=True)
+
+            # 실패 원인 분석
+            reasons = pd.DataFrame(fail_log)["실패사유"].value_counts()
+            if "API 키 없음" in reasons.index:
+                st.error("API 키가 유효하지 않습니다. Streamlit Secrets의 ALADIN_TTB_KEY를 확인하세요.")
+            elif reasons.index.str.contains("HTTP").any():
+                st.error(f"API 서버 오류: {reasons[reasons.index.str.contains('HTTP')].index.tolist()}")
+            elif reasons.index.str.contains("타임아웃").any():
+                st.warning("일부 요청이 타임아웃됐습니다. 네트워크 상태를 확인하거나 다시 시도하세요.")
+            elif (reasons.index == "검색 결과 없음").any():
+                st.info("검색 결과가 없는 도서는 서명이 정확한지 확인하세요.")
+
     return df
 
 # ────────────────────────────────────────────
