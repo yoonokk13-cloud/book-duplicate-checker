@@ -5,11 +5,11 @@
 """
 
 import io
-import time
 import requests
 import streamlit as st
 import pandas as pd
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -179,10 +179,12 @@ def show_mapping_editor(df: pd.DataFrame, required: list[str], label: str) -> pd
 # ────────────────────────────────────────────
 # 기능 2: 알라딘 API로 ISBN13 자동 조회
 # ────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_isbn_from_aladin(title: str, author: str, ttb_key: str) -> str | None:
     """
     알라딘 API로 서명+저자 검색 → ISBN13 반환.
-    못 찾으면 None 반환.
+    결과는 1시간 캐싱 — 같은 서명은 재실행해도 API 재호출 없음.
     """
     query = f"{title} {author}".strip()
     url = "https://www.aladin.co.kr/ttb/api/ItemSearch.aspx"
@@ -202,48 +204,64 @@ def fetch_isbn_from_aladin(title: str, author: str, ttb_key: str) -> str | None:
         items = data.get("item", [])
         if not items:
             return None
-        # 서명이 정확히 일치하는 항목 우선 선택
         title_norm = clean_text(title)
         for item in items:
             if clean_text(item.get("title", "")) == title_norm:
                 return str(item.get("isbn13", "")) or None
-        # 완전 일치 없으면 첫 번째 결과 반환
         return str(items[0].get("isbn13", "")) or None
     except Exception:
         return None
 
 def enrich_library_with_isbn(df: pd.DataFrame, ttb_key: str) -> pd.DataFrame:
     """
-    소장 목록 DataFrame에 ISBN13 컬럼을 추가.
-    이미 ISBN13이 있는 행은 건너뜀.
+    소장 목록 ISBN13 자동 조회.
+    - 병렬 호출(최대 10개 동시)로 속도 향상
+    - @st.cache_data로 동일 서명 재조회 방지
     """
     if "ISBN13" not in df.columns:
         df["ISBN13"] = ""
 
-    total = len(df)
-    progress = st.progress(0, text="ISBN 조회 중...")
-    status   = st.empty()
+    # 조회가 필요한 행만 추출
+    needs_lookup = [
+        idx for idx in df.index
+        if not (clean_isbn(df.at[idx, "ISBN13"]) not in ("", "nan")
+                and len(clean_isbn(df.at[idx, "ISBN13"])) == 13)
+    ]
 
-    for i, idx in enumerate(df.index):
-        existing = clean_isbn(df.at[idx, "ISBN13"])
-        if existing and existing != "nan" and len(existing) == 13:
-            # 이미 유효한 ISBN 있음 → 스킵
-            progress.progress((i + 1) / total, text=f"ISBN 조회 중... ({i+1}/{total})")
-            continue
+    total   = len(df)
+    to_fetch = len(needs_lookup)
+    done_count = total - to_fetch
 
-        title  = str(df.at[idx, "서명"])
-        author = str(df.at[idx, "저자"]) if "저자" in df.columns else ""
-        status.caption(f"조회 중: {title}")
+    progress = st.progress(done_count / total, text=f"ISBN 조회 중... (0/{to_fetch})")
+    completed = 0
 
-        isbn = fetch_isbn_from_aladin(title, author, ttb_key)
-        df.at[idx, "ISBN13"] = isbn if isbn else ""
+    # 병렬 호출: 최대 10개 동시
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_idx = {
+            executor.submit(
+                fetch_isbn_from_aladin,
+                str(df.at[idx, "서명"]),
+                str(df.at[idx, "저자"]) if "저자" in df.columns else "",
+                ttb_key,
+            ): idx
+            for idx in needs_lookup
+        }
 
-        progress.progress((i + 1) / total, text=f"ISBN 조회 중... ({i+1}/{total})")
-        time.sleep(0.3)  # API 호출 간격 (초당 최대 5회 제한)
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            isbn = future.result()
+            df.at[idx, "ISBN13"] = isbn if isbn else ""
+
+            completed += 1
+            progress.progress(
+                (done_count + completed) / total,
+                text=f"ISBN 조회 중... ({completed}/{to_fetch})",
+            )
 
     progress.empty()
-    status.empty()
-    found = df["ISBN13"].apply(lambda x: bool(clean_isbn(x) and clean_isbn(x) != "nan")).sum()
+    found = df["ISBN13"].apply(
+        lambda x: clean_isbn(x) not in ("", "nan") and len(clean_isbn(x)) == 13
+    ).sum()
     st.success(f"ISBN 조회 완료: 전체 {total}건 중 **{found}건** 확인")
     return df
 
