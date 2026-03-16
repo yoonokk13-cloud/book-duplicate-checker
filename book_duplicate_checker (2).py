@@ -191,7 +191,7 @@ def fetch_isbn_from_aladin(title: str, author: str, ttb_key: str) -> str | None:
     params = {
         "TTBKey": ttb_key,
         "Query": query,
-        "QueryType": "Title",
+        "QueryType": "Keyword",  # Title → Keyword: 제목+저자 통합 검색
         "MaxResults": 3,
         "start": 1,
         "SearchTarget": "Book",
@@ -207,8 +207,12 @@ def fetch_isbn_from_aladin(title: str, author: str, ttb_key: str) -> str | None:
         title_norm = clean_text(title)
         for item in items:
             if clean_text(item.get("title", "")) == title_norm:
-                return str(item.get("isbn13", "")) or None
-        return str(items[0].get("isbn13", "")) or None
+                isbn13 = str(item.get("isbn13", "")).strip()
+                if isbn13 and isbn13 != "0" and len(isbn13) == 13:
+                    return isbn13
+        # 제목 완전 일치 항목 없을 때 첫 번째 결과 사용
+        isbn13 = str(items[0].get("isbn13", "")).strip()
+        return isbn13 if isbn13 and isbn13 != "0" and len(isbn13) == 13 else None
     except Exception:
         return None
 
